@@ -1,0 +1,438 @@
+name: Radar Ofertas Pro Max
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '3-58/5 * * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: radar-ofertas-promax
+  cancel-in-progress: false
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Preparar lector de paginas
+        run: python3 -m pip install --disable-pip-version-check beautifulsoup4==4.15.0
+      - name: Recuperar historial
+        uses: actions/cache/restore@v4
+        with:
+          path: radar-state
+          key: radar-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            radar-state-v1-
+      - name: Revisar precios y enviar alertas
+        id: monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPORT: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          python3 -u - <<'PY'
+          """Radar personal: fuentes publicas, sin compras ni bypass de bloqueos."""
+          import argparse
+          import hashlib
+          import json
+          import math
+          import os
+          import statistics
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import urllib.robotparser
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          
+          UA = 'RadarOfertasProMax/1.0 (+https://github.com/Ofertaspromaxcl/radar-ofertas-promax)'
+          PENDING = 'Ripley, Lider, Paris, Falabella, Mercado Libre y Nike: pendientes, sin monitoreo.'
+          SOURCES = {
+              'block': ('Block', 'https://www.blockstore.cl'),
+              'theline': ('The Line', 'https://www.theline.cl'),
+              'abc': ('ABC', 'https://www.abc.cl'),
+              'adidas': ('Adidas', 'https://www.adidas.cl'),
+          }
+          NOW = int(time.time())
+          ROBOTS = {}
+          
+          
+          class SourceError(Exception):
+              pass
+          
+          
+          def fetch(url):
+              try:
+                  request = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept': 'application/json,text/html;q=0.9,*/*;q=0.1'})
+                  with urllib.request.urlopen(request, timeout=22) as response:
+                      data = response.read(12_000_001)
+                      if len(data) > 12_000_000:
+                          raise SourceError('Respuesta demasiado grande')
+                      return data.decode('utf-8')
+              except urllib.error.HTTPError as error:
+                  raise SourceError('HTTP ' + str(error.code)) from None
+              except (urllib.error.URLError, TimeoutError, UnicodeError):
+                  raise SourceError('Error de conexion o respuesta') from None
+          
+          
+          def get(url):
+              parts = urllib.parse.urlsplit(url)
+              base = parts.scheme + '://' + parts.netloc
+              if base not in {v[1] for v in SOURCES.values()}:
+                  raise SourceError('Dominio no autorizado')
+              if base not in ROBOTS:
+                  parser = urllib.robotparser.RobotFileParser()
+                  try:
+                      robots_text = fetch(base + '/robots.txt')
+                  except SourceError as error:
+                      if str(error) != 'HTTP 404':
+                          raise
+                      robots_text = 'User-agent: *\nAllow: /'
+                  parser.parse(robots_text.splitlines())
+                  ROBOTS[base] = parser
+              if not ROBOTS[base].can_fetch(UA, url):
+                  raise SourceError('Consulta no permitida por robots.txt')
+              delay = max(ROBOTS[base].crawl_delay(UA) or 1, 1)
+              if delay > 30:
+                  raise SourceError('La tienda requiere intervalos mayores; fuente pendiente')
+              time.sleep(delay)
+              return fetch(url)
+          
+          
+          def money(value):
+              try:
+                  result = float(value)
+                  return round(result) if math.isfinite(result) and 0 < result < 100_000_000 else None
+              except (TypeError, ValueError):
+                  return None
+          
+          
+          def product(source, pid, vid, name, price, regular, url, size='', stock='Publicado disponible'):
+              base = SOURCES[source][1]
+              url = urllib.parse.urljoin(base, url)
+              if urllib.parse.urlsplit(url).netloc != urllib.parse.urlsplit(base).netloc:
+                  return None
+              price = money(price)
+              if price is None:
+                  return None
+              return dict(key=f'{source}:{pid}:{vid}', group=f'{source}:{pid}', source=source,
+                          name=str(name)[:180], price=price, regular=money(regular), url=url,
+                          size=str(size)[:60], stock=stock)
+          
+          
+          def block(text):
+              data = json.loads(text)
+              products = data['products']
+              rows = []
+              for p in products:
+                  category = (p.get('product_type', '') + ' ' + p.get('title', '')).lower()
+                  if not p.get('title', '').lower().startswith(('zapatilla', 'sneaker')):
+                      continue
+                  for v in p.get('variants', []):
+                      if v.get('available') is not True:
+                          continue
+                      rows.append(product('block', p['id'], v['id'], p['title'], v['price'],
+                                          v.get('compare_at_price'), '/products/' + p['handle'] + '?variant=' + str(v['id']),
+                                          v.get('title', '')))
+              return [r for r in rows if r], len(products)
+          
+          
+          def theline(text):
+              data = json.loads(text)
+              if not isinstance(data, list):
+                  raise SourceError('Formato de catalogo inesperado')
+              rows = []
+              for p in data:
+                  if not any('ZAPATILLA' in x.upper() for x in p.get('categories', [])):
+                      continue
+                  for v in p.get('items', []):
+                      for s in v.get('sellers', []):
+                          if str(s.get('sellerId')) != '1' or s.get('sellerName') != 'The Line Group':
+                              continue
+                          offer = s.get('commertialOffer', {})
+                          if offer.get('IsAvailable') is not True or offer.get('AvailableQuantity', 0) <= 0:
+                              continue
+                          rows.append(product('theline', p['productId'], v['itemId'], p['productName'],
+                                              offer.get('Price'), offer.get('ListPrice'), p['link'],
+                                              ', '.join(v.get('TALLA', []))))
+              return [r for r in rows if r], len(data)
+          
+          
+          def abc(text):
+              soup = BeautifulSoup(text, 'html.parser')
+              tiles = soup.select('.lp-product-tile')
+              if not tiles:
+                  raise SourceError('No se encontraron productos ABC')
+              rows = []
+              for tile in tiles:
+                  anchor = tile.select_one('.pdp-link a[itemprop="url"]')
+                  price = tile.select_one('.js-internet-price .price-value[data-value]')
+                  regular = tile.select_one('.js-normal-price .price-value[data-value]')
+                  button = tile.select_one('button.add-to-cart[data-pid]')
+                  if not all((anchor, price, button)) or button.has_attr('disabled'):
+                      continue
+                  # Se usa solo el precio Internet; se excluye el precio condicionado a tarjeta.
+                  rows.append(product('abc', button['data-pid'], 'internet', anchor.get_text(' ', strip=True),
+                                      price['data-value'], regular['data-value'] if regular else None,
+                                      anchor['href'], stock='Boton de compra disponible; confirmar despacho a tu comuna'))
+              return [r for r in rows if r], len(tiles)
+          
+          
+          def adidas(text):
+              soup = BeautifulSoup(text, 'html.parser')
+              rows = []
+              for script in soup.select('script[type="application/ld+json"]'):
+                  try:
+                      data = json.loads(script.string or script.get_text())
+                  except ValueError:
+                      continue
+                  def visit(value):
+                      if isinstance(value, dict):
+                          if value.get('@type') == 'Product':
+                              o = value.get('offers', {})
+                              if isinstance(o, dict) and o.get('priceCurrency') == 'CLP' and str(o.get('availability', '')).endswith('/InStock'):
+                                  url = value.get('url', '')
+                                  rows.append(product('adidas', url.split('/')[-1], 'catalogo', value.get('name', ''),
+                                                      o.get('price'), None, url,
+                                                      stock='Disponible segun catalogo; confirmar talla'))
+                          else:
+                              for v in value.values():
+                                  visit(v)
+                      elif isinstance(value, list):
+                          for v in value:
+                              visit(v)
+                  visit(data)
+              if not rows:
+                  raise SourceError('No se encontraron precios CLP disponibles en Adidas')
+              return [r for r in rows if r], len(rows)
+          
+          
+          PARSERS = {'block': block, 'theline': theline, 'abc': abc, 'adidas': adidas}
+          
+          
+          def urls(source, cursor):
+              base = SOURCES[source][1]
+              if source == 'block':
+                  return [base + '/collections/zapatillas/products.json?limit=250&page=' + str(p) for p in sorted({1, cursor + 1})]
+              if source == 'theline':
+                  prefix = base + '/api/catalog_system/pub/products/search?fq=C%3A%2F30%2F&'
+                  result = [prefix + '_from=0&_to=49&O=OrderByBestDiscountDESC']
+                  result.append(prefix + '_from=' + str(cursor * 50) + '&_to=' + str(cursor * 50 + 49) + '&O=OrderByNameASC')
+                  return result
+              if source == 'abc':
+                  return [base + '/tecnologia/?start=' + str(p * 36) + '&sz=36' for p in sorted({0, cursor})]
+              return [base + '/zapatillas?start=' + str(p * 48) for p in sorted({0, cursor})]
+          
+          
+          def scan(source, cursor):
+              rows, counts = {}, []
+              for url in urls(source, cursor):
+                  found, count = PARSERS[source](get(url))
+                  counts.append(count)
+                  for row in found:
+                      row['check_url'] = url
+                      rows[row['key']] = row
+              return list(rows.values()), counts[-1]
+          
+          
+          def reference(row, history):
+              samples = history.get('samples', [])
+              valid = [(t, p) for t, p in samples if NOW - 7 * 86400 <= t <= NOW - 1800]
+              if len(valid) >= 3:
+                  ref = int(statistics.median(p for _, p in valid))
+                  if row['price'] <= ref * .60 and ref - row['price'] >= 10000:
+                      return ref, 'mediana observada (7 dias, muestras de al menos 30 minutos)', 1 - row['price'] / ref
+              ref = row.get('regular')
+              if ref and row['price'] <= ref * .30 and ref - row['price'] >= 10000:
+                  return ref, 'precio de lista publicado por la tienda (no historico verificado)', 1 - row['price'] / ref
+              return None
+          
+          
+          def clp(value):
+              return '$' + f'{value:,}'.replace(',', '.')
+          
+          
+          def alert_text(row, ref):
+              amount, kind, drop = ref
+              size = '\nVariante/talla publicada: ' + row['size'] if row['size'] else ''
+              return ('Posible oportunidad | ' + SOURCES[row['source']][0] + '\n' + row['name']
+                      + '\nAhora: ' + clp(row['price']) + ' CLP\nReferencia: ' + clp(amount)
+                      + '\nBaja: ' + f'{drop:.0%}' + '\nBase: ' + kind + size + '\n'
+                      + row['stock'] + '\n' + row['url']
+                      + '\n\nPrecio consultado dos veces. No confirma un error de precio. '
+                      + 'Revisa total, talla y envio antes de pagar. Sin compra automatica.')
+          
+          
+          def telegram(method, data):
+              token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+              try:
+                  request = urllib.request.Request('https://api.telegram.org/bot' + token + '/' + method,
+                              data=json.dumps(data).encode(), headers={'Content-Type': 'application/json'})
+                  with urllib.request.urlopen(request, timeout=25) as r:
+                      result = json.load(r)
+                  if not result.get('ok'):
+                      raise SourceError('Telegram rechazo la solicitud')
+                  return result['result']
+              except (urllib.error.URLError, TimeoutError, ValueError):
+                  raise SourceError('No se pudo contactar Telegram; revisa los dos secretos') from None
+          
+          
+          def send(text, dry):
+              if dry:
+                  print('SIMULACION:', text[:240].replace('\n', ' | '))
+              else:
+                  telegram('sendMessage', {'chat_id': os.environ['TELEGRAM_CHAT_ID'].strip(), 'text': text[:4000],
+                                           'link_preview_options': {'is_disabled': True}})
+          
+          
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--dry-run', action='store_true')
+              parser.add_argument('--source', choices=list(SOURCES))
+              parser.add_argument('--state', default='radar-state/state.json')
+              args = parser.parse_args()
+              if not args.dry_run:
+                  if not all(os.environ.get(k, '').strip() for k in ('TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID')):
+                      sys.exit('Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en los secretos.')
+                  if not os.environ['TELEGRAM_CHAT_ID'].strip().isdigit():
+                      sys.exit('TELEGRAM_CHAT_ID debe ser el numero del chat privado recibido en la prueba.')
+              path = Path(args.state)
+              state = json.loads(path.read_text()) if path.exists() else {}
+              first = not state
+              state.setdefault('history', {})
+              state.setdefault('sent', {})
+              state.setdefault('cursors', {})
+              state.setdefault('health', {})
+              state.setdefault('paused', False)
+              wants_report = os.environ.get('REPORT', '') == 'true' or first
+              if not args.dry_run:
+                  updates = telegram('getUpdates', {'offset': state.get('offset', 0), 'timeout': 0, 'limit': 100})
+                  for update in updates:
+                      state['offset'] = max(state.get('offset', 0), update['update_id'] + 1)
+                      m = update.get('message', {})
+                      if str(m.get('chat', {}).get('id')) != os.environ['TELEGRAM_CHAT_ID'].strip():
+                          continue
+                      command = m.get('text', '').strip().split(' ')[0].split('@')[0]
+                      if command in ('/estado', '/start', '/ayuda'):
+                          wants_report = True
+                      elif command in ('/pausa', '/reanudar'):
+                          state['paused'] = command == '/pausa'
+                          wants_report = True
+              report, all_rows, changed_health = [], [], False
+              active_sources = [args.source] if args.source else list(SOURCES)
+              if not state['paused']:
+                  for source in active_sources:
+                      try:
+                          rows, count = scan(source, state['cursors'].get(source, 0))
+                          if not rows:
+                              raise SourceError('Sin productos elegibles disponibles en la muestra')
+                          health = 'OK'
+                          all_rows.extend(rows)
+                          cursor = state['cursors'].get(source, 0)
+                          size = {'block': 250, 'theline': 50, 'abc': 36, 'adidas': 48}[source]
+                          cap = {'block': 39, 'theline': 49, 'abc': 99, 'adidas': 99}[source]
+                          state['cursors'][source] = 0 if count < size or cursor >= cap else cursor + 1
+                          text = f'{SOURCES[source][0]}: {len(rows)} variantes/productos disponibles en paginas revisadas.'
+                      except (SourceError, KeyError, TypeError, ValueError) as error:
+                          health = str(error) if isinstance(error, SourceError) else 'Cambio de formato; revisar adaptador'
+                          state['cursors'][source] = 0
+                          text = SOURCES[source][0] + ': SIN COBERTURA en esta ejecucion (' + health + ').'
+                      changed_health |= state['health'].get(source) != health
+                      state['health'][source] = health
+                      report.append(text)
+                      print(text)
+              else:
+                  report.append('Alertas y consultas pausadas. Envia /reanudar para continuar.')
+              candidates = {}
+              for row in all_rows:
+                  hist = state['history'].get(row['key'], {})
+                  ref = reference(row, hist)
+                  fingerprint = row['group'] + ':' + str(row['price'])
+                  last = state['sent'].get(fingerprint, 0)
+                  if ref and NOW - last > 7 * 86400:
+                      old = candidates.get(row['group'])
+                      if old is None or row['price'] < old[0]['price']:
+                          candidates[row['group']] = (row, ref, fingerprint)
+              checked, sent_count = {}, 0
+              for row, ref, fingerprint in sorted(candidates.values(), key=lambda c: c[1][2], reverse=True)[:10]:
+                  try:
+                      url = row['check_url']
+                      if url not in checked:
+                          check_rows, _ = PARSERS[row['source']](get(url))
+                          checked[url] = {r['key']: r for r in check_rows}
+                      current = checked[url].get(row['key'])
+                      if not current or current['price'] != row['price']:
+                          continue
+                      send(alert_text(row, ref), args.dry_run)
+                      state['sent'][fingerprint] = NOW
+                      sent_count += 1
+                  except SourceError:
+                      print('No se confirmo una oportunidad; no se marco como enviada.')
+              for row in all_rows:
+                  hist = state['history'].setdefault(row['key'], {'samples': []})
+                  samples = [(t, p) for t, p in hist['samples'] if NOW - t < 7 * 86400]
+                  # Una muestra por media hora evita que una pagina frecuente pese mas.
+                  if not samples or NOW - samples[-1][0] >= 1800:
+                      samples.append((NOW, row['price']))
+                  hist.update(samples=samples[-336:], seen=NOW)
+              state['history'] = {k: v for k, v in state['history'].items() if NOW - v.get('seen', 0) < 14 * 86400}
+              state['sent'] = {k: v for k, v in state['sent'].items() if NOW - v < 7 * 86400}
+              if wants_report or changed_health or NOW - state.get('report_at', 0) >= 86400:
+                  text = ('Radar Ofertas Pro Max | Estado\n\n' + '\n'.join(report)
+                          + '\n\nAlertas enviadas en esta revision: ' + str(sent_count)
+                          + '\nHistorial: ' + ('iniciado; aun no hay referencia historica suficiente.' if first else 'se conserva entre ejecuciones.')
+                          + '\n\n' + PENDING
+                          + '\n\nRevision programada cada 5 minutos, con posibles retrasos de GitHub. '
+                          + 'Se revisan paginas iniciales y una pagina rotativa; NO todo el catalogo cada 5 minutos. '
+                          + 'La cobertura depende del acceso desde GitHub. Los precios pueden estar cacheados por la tienda.'
+                          + '\n\n/estado /pausa /reanudar (se procesan en la siguiente ejecucion).')
+                  send(text, args.dry_run)
+                  state['report_at'] = NOW
+              path.parent.mkdir(parents=True, exist_ok=True)
+              temporary = path.with_suffix('.tmp')
+              temporary.write_text(json.dumps(state, ensure_ascii=False))
+              temporary.replace(path)
+              print('Revision terminada. No se realizan compras.')
+              return 1 if not state['paused'] and not all_rows else 0
+          
+          
+          if __name__ == '__main__':
+              try:
+                  sys.exit(main())
+              except SourceError as error:
+                  sys.exit(str(error))
+          PY
+      - name: Guardar historial
+        id: guardar
+        if: always() && steps.monitor.outcome != 'skipped' && hashFiles('radar-state/state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: radar-state
+          key: radar-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Conservar solo tres copias del historial
+        if: always() && steps.guardar.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RADAR_REPO: ${{ github.repository }}
+          RADAR_REF: ${{ github.ref }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          base = 'https://api.github.com/repos/' + os.environ['RADAR_REPO'] + '/actions/caches'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'}
+          req = urllib.request.Request(base + '?key=radar-state-v1-&per_page=100&sort=created_at&direction=desc', headers=headers)
+          with urllib.request.urlopen(req, timeout=20) as response:
+              caches = json.load(response)['actions_caches']
+          own = [c for c in caches if c['key'].startswith('radar-state-v1-') and c['ref'] == os.environ['RADAR_REF']]
+          for cache in own[3:]:
+              req = urllib.request.Request(base + '/' + str(cache['id']), headers=headers, method='DELETE')
+              with urllib.request.urlopen(req, timeout=20):
+                  pass
+          print('Historial conservado; copias antiguas limitadas.')
+          PY
