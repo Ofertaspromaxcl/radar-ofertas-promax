@@ -1,0 +1,66 @@
+name: Conectar Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      codigo:
+        description: Codigo enviado a tu bot despues de /vincular
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  conectar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Enviar mensaje de prueba
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CODIGO: ${{ inputs.codigo }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          import urllib.request
+
+          token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+          codigo = os.environ.get('CODIGO', '').strip()
+          if not token:
+              sys.exit('Falta el secreto TELEGRAM_BOT_TOKEN.')
+          if not re.fullmatch(r'[A-Za-z0-9_-]{20,80}', codigo):
+              sys.exit('Usa un codigo de 20 a 80 letras, numeros o guiones.')
+
+          def telegram(metodo, datos):
+              request = urllib.request.Request(
+                  'https://api.telegram.org/bot' + token + '/' + metodo,
+                  data=json.dumps(datos).encode(),
+                  headers={'Content-Type': 'application/json'})
+              try:
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      resultado = json.load(response)
+              except Exception:
+                  sys.exit('No se pudo contactar Telegram. Revisa el token y vuelve a ejecutar.')
+              if not resultado.get('ok'):
+                  sys.exit('Telegram rechazo la solicitud. Revisa la configuracion del bot.')
+              return resultado['result']
+
+          updates = telegram('getUpdates', {'limit': 100, 'timeout': 0})
+          chats = set()
+          for update in updates:
+              message = update.get('message', {})
+              chat = message.get('chat', {})
+              if (chat.get('type') == 'private'
+                  and message.get('text', '').strip() == '/vincular ' + codigo):
+                  chats.add(chat['id'])
+          if len(chats) != 1:
+              sys.exit('No se encontro un chat unico. Envia /vincular y el codigo a tu bot y ejecuta otra vez.')
+          chat_id = chats.pop()
+          telegram('sendMessage', {
+              'chat_id': chat_id,
+              'text': 'Conexion correcta con Radar Ofertas Pro Max.\n\n'
+                      'Guarda este numero como secreto TELEGRAM_CHAT_ID en GitHub:\n'
+                      + str(chat_id) + '\n\n'
+                      'Esta es solo una prueba. El monitoreo de precios aun no esta activo.'})
+          print('Mensaje de prueba enviado. Abre tu Telegram para ver el resultado.')
+          PY
